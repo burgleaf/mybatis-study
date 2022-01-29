@@ -401,6 +401,8 @@ typeAliasRegistry和typeHandlerRegistry这两个属性的值是在Configuration�
 
 同时mybatis还会加载我们在mapper.xml里定义的sql方法，并把他封装在了mappedStatements和loadedResources里了。
 
+## SqlSession构建过程
+
 那么构建SqlSessionFactory的流程就大概整明白了，我们接下来看一下SqlSession是怎么被创建出来的。
 先写一段测试代码：
 ```java
@@ -417,7 +419,7 @@ typeAliasRegistry和typeHandlerRegistry这两个属性的值是在Configuration�
         sqlSession.close();
     }
 ```
-## SqlSession构建过程
+
 
 先看这一句：
 ```java
