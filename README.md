@@ -549,7 +549,9 @@ public class SimpleExecutor extends BaseExecutor {
 看到这里openSession的所有操作就看完了。可以总结一下：
 
 1.openSession通过之前构建好的Configuration实例拿到了Transaction对象
+
 2.通过transaction对象和ExecutorType类型给我们创建好了一个数据库的执行器Executor，默认的Executor是SimpleExecutor
+
 3.通过Executor创建了一个DefaultSqlSession实例给我们
 
 可以画个时序图出来：
