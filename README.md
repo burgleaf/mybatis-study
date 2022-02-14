@@ -561,5 +561,646 @@ public class SimpleExecutor extends BaseExecutor {
 
 下面一篇文章我将带着大家一起学习mybatis核心组件Executor的执行过程，希望可以给你带来收获。
 
+# mybatis源码分析（三）：mybaits是如何执行一条sql语句的
+
+## mybatis代理对象的创建过程
+
+在上一遍 [mybatis源码分析（二）：mybatis在执行SQL语句之前都做了什么](https://juejin.cn/post/7064504729316884516) 中我们通过源码分析看到mybatis是如何构建SqlSessionFactory和SqlSession的。其中我们看到SqlSession在构建的过程中构建了一个Executor，在Executor里包含了大量的数据库操作，于是猜测Executor就是mybatis执行SQL语句的核心组件。
+
+这篇文章我们将继续深入mybatis源码来研究一下mybatis是如何执行一条sql语句的，同时mybatis又是如何处理输入参数和输出结果的。
+
+首先我们写一段测试代码：
+
+*执行sql语句的mapper接口：*
+```java
+
+public interface DistrictMapper {
+
+    District getById(Integer id);
+}
+```
+*mapper对应的sql xml文件：*
+```xml
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="me.binf.mybatistudy.dao.DistrictMapper">
+
+    <select id="getById" resultType="me.binf.mybatistudy.entity.District">
+        select * from district where id = #{id}
+    </select>
+
+</mapper>
+```
+*测试用例：*
+```java
+    @Test
+    public void testMyBatis() throws IOException {
+        //1、得到 SqlSessionFactory
+        SqlSessionFactory sqlSessionFactory = getSqlSessionFactory();
+        //2、得到 sqlSession ,代表和数据库一次回话
+        SqlSession sqlSession = sqlSessionFactory.openSession();
+        //3、得到真正操作数据库的Mapper
+        DistrictMapper mapper = sqlSession.getMapper(DistrictMapper.class);
+        //4.执行方法方法并得到结果
+        District district = mapper.getById(1);
+        System.out.println(district);
+        //5.关闭sqlSession
+        sqlSession.close();
+    }
+```
+上面三段代码我们上一篇文章已经分析过了，今天我们主要是Debug这两段代码：
+```java
+    //3、得到真正操作数据库的Mapper
+    DistrictMapper mapper = sqlSession.getMapper(DistrictMapper.class);
+    //4.执行方法方法并得到结果
+    District district = mapper.getById(1);
+```
+要知道**DistrictMapper**是一个接口，接口是没办法执行的。
+```java
+DistrictMapper mapper = sqlSession.getMapper(DistrictMapper.class);
+```
+那么这段代码一定是mybatis为我们生成了一个代理对象，我们进去看一下。
+```java
+public class DefaultSqlSession implements SqlSession {
+  @Override
+  public <T> T getMapper(Class<T> type) {
+    return configuration.getMapper(type, this);
+  }
+  ......
+}
+
+public class Configuration {
+
+  protected final MapperRegistry mapperRegistry = new MapperRegistry(this);
+
+  public <T> T getMapper(Class<T> type, SqlSession sqlSession) {
+    return mapperRegistry.getMapper(type, sqlSession);
+  }
+  ......
+}
+
+public class MapperRegistry {
+
+  private final Map<Class<?>, MapperProxyFactory<?>> knownMappers = new HashMap<>();
+
+ @SuppressWarnings("unchecked")
+ public <T> T getMapper(Class<T> type, SqlSession sqlSession) {
+    final MapperProxyFactory<T> mapperProxyFactory = (MapperProxyFactory<T>) knownMappers.get(type);
+    if (mapperProxyFactory == null) {
+      throw new BindingException("Type " + type + " is not known to the MapperRegistry.");
+    }
+    try {
+      return mapperProxyFactory.newInstance(sqlSession);
+    } catch (Exception e) {
+      throw new BindingException("Error getting mapper instance. Cause: " + e, e);
+    }
+  }
+......
+}
+
+```
+我把mybatis生成代理对象核心的三个方法摘录下来了，可以看到mybatis并没有直接生成代理对象，而是使用**MapperProxyFactory**来生成DistrictMapper的代理对象。而**MapperProxyFactory**是mybatis在构建SqlSessionFactory的时候就已经创建好，并且放入到**MapperRegistry**这个类的**knownMappers**属性Map中的。
+
+那么我们可以再来回溯一下**MapperProxyFactory**的创建过程：
+```java
+public class XMLMapperBuilder extends BaseBuilder {
+
+  public void parse() {
+    if (!configuration.isResourceLoaded(resource)) {
+      configurationElement(parser.evalNode("/mapper"));
+      configuration.addLoadedResource(resource);
+      //用xml的namespace构建mapper
+      bindMapperForNamespace();
+    }
+
+    parsePendingResultMaps();
+    parsePendingCacheRefs();
+    parsePendingStatements();
+  }
+
+  private void bindMapperForNamespace() {
+    String namespace = builderAssistant.getCurrentNamespace();
+    if (namespace != null) {
+      Class<?> boundType = null;
+      try {
+        boundType = Resources.classForName(namespace);
+      } catch (ClassNotFoundException e) {
+        // ignore, bound type is not required
+      }
+      if (boundType != null && !configuration.hasMapper(boundType)) {
+        // Spring may not know the real resource name so we set a flag
+        // to prevent loading again this resource from the mapper interface
+        // look at MapperAnnotationBuilder#loadXmlResource
+        configuration.addLoadedResource("namespace:" + namespace);
+        configuration.addMapper(boundType);
+      }
+    }
+  }
+
+ public <T> void addMapper(Class<T> type) {
+    mapperRegistry.addMapper(type);
+  }
+......
+}
+```
+```java
+public class MapperRegistry {
+
+private final Map<Class<?>, MapperProxyFactory<?>> knownMappers = new HashMap<>();
+
+public <T> void addMapper(Class<T> type) {
+    if (type.isInterface()) {
+      if (hasMapper(type)) {
+        throw new BindingException("Type " + type + " is already known to the MapperRegistry.");
+      }
+      boolean loadCompleted = false;
+      try {
+        knownMappers.put(type, new MapperProxyFactory<>(type));
+        // It's important that the type is added before the parser is run
+        // otherwise the binding may automatically be attempted by the
+        // mapper parser. If the type is already known, it won't try.
+        MapperAnnotationBuilder parser = new MapperAnnotationBuilder(config, type);
+        parser.parse();
+        loadCompleted = true;
+      } finally {
+        if (!loadCompleted) {
+          knownMappers.remove(type);
+        }
+      }
+    }
+  }
+......
+}
+```
+可以看到mybatis创建MapperProxyFactory过程是：
+1. 加载mybatis配置文件对应的所有mapper.xml路径
+2. 解析mapper.xml里所有的namespace标签，根据标签生成对应接口的Class对象
+3. 把Class对象作为key，创建MapperProxyFactory对象作为value，然后放进knownMappers里面
+
+同时我们还可以看到mybatis在初始化阶段不光解析了mapper.xml里namespace标签，还解析了ResultMaps、CacheRefs、Statements具体有什么左右我们后面再研究。**可以看到mybatis这么设计的好处是可以在项目启动阶段就可以帮你检查出xml和接口对应关系是否正确，同时提前把MapperProxyFactory构建好缓存起来还可以加快后面程序运行的效率。**
+
+## mybatis是如何为执行SQL语句做准备的
+MapperProxyFactory对象已经有了，那么接下来就是mybatis如何执行SQL语句了。
+```java
+public class MapperProxyFactory<T> {
+
+  private final Class<T> mapperInterface;
+  private final Map<Method, MapperMethodInvoker> methodCache = new ConcurrentHashMap<>();
+
+  @SuppressWarnings("unchecked")
+  protected T newInstance(MapperProxy<T> mapperProxy) {
+    return (T) Proxy.newProxyInstance(mapperInterface.getClassLoader(), new Class[] { mapperInterface }, mapperProxy);
+  }
+
+ ......
+}
+```
+动态代理newProxyInstance核心参数是**InvocationHandler**，而**MapperProxy**就是mybatis为InvocationHandler提供的实现类。我们主要去看MapperProxy类的**invoke()**方法，这个方法就是mybatis执行sql语句的入口。
+
+```java
+public class MapperProxy<T> implements InvocationHandler, Serializable {
+ @Override
+  public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+    try {
+      if (Object.class.equals(method.getDeclaringClass())) {
+        return method.invoke(this, args);
+      } else {
+        return cachedInvoker(method).invoke(proxy, method, args, sqlSession);
+      }
+    } catch (Throwable t) {
+      throw ExceptionUtil.unwrapThrowable(t);
+    }
+  }
+
+  private MapperMethodInvoker cachedInvoker(Method method) throws Throwable {
+    try {
+      return MapUtil.computeIfAbsent(methodCache, method, m -> {
+        if (m.isDefault()) {
+          try {
+            if (privateLookupInMethod == null) {
+              return new DefaultMethodInvoker(getMethodHandleJava8(method));
+            } else {
+              return new DefaultMethodInvoker(getMethodHandleJava9(method));
+            }
+          } catch (IllegalAccessException | InstantiationException | InvocationTargetException
+              | NoSuchMethodException e) {
+            throw new RuntimeException(e);
+          }
+        } else {
+          return new PlainMethodInvoker(new MapperMethod(mapperInterface, method, sqlSession.getConfiguration()));
+        }
+      });
+    } catch (RuntimeException re) {
+      Throwable cause = re.getCause();
+      throw cause == null ? re : cause;
+    }
+  }
+
+  private static class PlainMethodInvoker implements MapperMethodInvoker {
+    private final MapperMethod mapperMethod;
+
+    public PlainMethodInvoker(MapperMethod mapperMethod) {
+      super();
+      this.mapperMethod = mapperMethod;
+    }
+
+    @Override
+    public Object invoke(Object proxy, Method method, Object[] args, SqlSession sqlSession) throws Throwable {
+      return mapperMethod.execute(sqlSession, args);
+    }
+  }
+
+......
+}
+```
+可以看到mybatis缓存很多，调用invoke方法的时候mybatis会把目标方法对象给缓存起来，每一个目标方法对应一个私有静态类PlainMethodInvoker再去执行。
+
+```java
+public class MapperMethod {
+
+  private final SqlCommand command;
+  private final MethodSignature method;
+
+  public MapperMethod(Class<?> mapperInterface, Method method, Configuration config) {
+    this.command = new SqlCommand(config, mapperInterface, method);
+    this.method = new MethodSignature(config, mapperInterface, method);
+  }
+
+  public Object execute(SqlSession sqlSession, Object[] args) {
+    Object result;
+    switch (command.getType()) {
+      case INSERT: {
+        Object param = method.convertArgsToSqlCommandParam(args);
+        result = rowCountResult(sqlSession.insert(command.getName(), param));
+        break;
+      }
+      case UPDATE: {
+        Object param = method.convertArgsToSqlCommandParam(args);
+        result = rowCountResult(sqlSession.update(command.getName(), param));
+        break;
+      }
+      case DELETE: {
+        Object param = method.convertArgsToSqlCommandParam(args);
+        result = rowCountResult(sqlSession.delete(command.getName(), param));
+        break;
+      }
+      case SELECT:
+        if (method.returnsVoid() && method.hasResultHandler()) {
+          executeWithResultHandler(sqlSession, args);
+          result = null;
+        } else if (method.returnsMany()) {
+          result = executeForMany(sqlSession, args);
+        } else if (method.returnsMap()) {
+          result = executeForMap(sqlSession, args);
+        } else if (method.returnsCursor()) {
+          result = executeForCursor(sqlSession, args);
+        } else {
+          Object param = method.convertArgsToSqlCommandParam(args);
+          result = sqlSession.selectOne(command.getName(), param);
+          if (method.returnsOptional()
+              && (result == null || !method.getReturnType().equals(result.getClass()))) {
+            result = Optional.ofNullable(result);
+          }
+        }
+        break;
+      case FLUSH:
+        result = sqlSession.flushStatements();
+        break;
+      default:
+        throw new BindingException("Unknown execution method for: " + command.getName());
+    }
+    if (result == null && method.getReturnType().isPrimitive() && !method.returnsVoid()) {
+      throw new BindingException("Mapper method '" + command.getName()
+          + " attempted to return null from a method with a primitive return type (" + method.getReturnType() + ").");
+    }
+    return result;
+  }
+......
+}
+```
+PlainMethodInvoker再去调用**MapperMethod**的**execute**方法去执行SQL语句，mybatis的**MapperMethod**方法相当于整个框架的分拣车间的作用，分拣过程大概做了这几件事：
+1.**MapperMethod**实例化方法会把目标方法的所有信息包装成一个**SqlCommand**对象
+2.根据目标方法执行的SQL类型做判断，通过不同类型去执行对应的SQL逻辑
+3.根据查询方法的返回值类型去调用不同查询方法从而可以把查询结果包装成目标方法定义的返回类型
+4.根据入参的类型和个数把入参包装成框架方便解析的包装类型
+
+
+**这里可以看到mybatis的一个核心组件：ParamNameResolver参数解析器**。
+
+```java
+public class ParamNameResolver {
+  public static final String GENERIC_NAME_PREFIX = "param";
+
+  public Object getNamedParams(Object[] args) {
+    final int paramCount = names.size();
+    if (args == null || paramCount == 0) {
+      return null;
+    } else if (!hasParamAnnotation && paramCount == 1) {
+      Object value = args[names.firstKey()];
+      return wrapToMapIfCollection(value, useActualParamName ? names.get(0) : null);
+    } else {
+      final Map<String, Object> param = new ParamMap<>();
+      int i = 0;
+      for (Map.Entry<Integer, String> entry : names.entrySet()) {
+        param.put(entry.getValue(), args[entry.getKey()]);
+        // add generic param names (param1, param2, ...)
+        final String genericParamName = GENERIC_NAME_PREFIX + (i + 1);
+        // ensure not to overwrite parameter named with @Param
+        if (!names.containsValue(genericParamName)) {
+          param.put(genericParamName, args[entry.getKey()]);
+        }
+        i++;
+      }
+      return param;
+    }
+  }
+
+
+public static Object wrapToMapIfCollection(Object object, String actualParamName) {
+    if (object instanceof Collection) {
+      ParamMap<Object> map = new ParamMap<>();
+      map.put("collection", object);
+      if (object instanceof List) {
+        map.put("list", object);
+      }
+      Optional.ofNullable(actualParamName).ifPresent(name -> map.put(name, object));
+      return map;
+    } else if (object != null && object.getClass().isArray()) {
+      ParamMap<Object> map = new ParamMap<>();
+      map.put("array", object);
+      Optional.ofNullable(actualParamName).ifPresent(name -> map.put(name, object));
+      return map;
+    }
+    return object;
+  }
+}
+```
+解析参数的逻辑并不复杂，mybatis会判断你定义的目标方法参数的个数和类型：
+
+1.如果只有一个参数，并且参数不是集合类型或者是数组类型就直接返回参数值
+
+2.如果只有一个参数，但是参数的类型是集合类型或者数组类型，就会把参数放到map里面用**collection**(*如果参数是List类型还会再多放一个list名字的key和value*)或者**array**作为key，值作为value
+
+3.如果有多个参数，就会把参数名和参数值分别作为key和value放到map里面再返回，值得注意的是mybatis还会在map里再给你放一个别名的key，也就是**param+参数位置**（*如过参数是两个就是param1，param2分别对应第一个和第二个参数*）
+
+看到这里我们就可以得出一个结论，在mybatis的mapper.xml里面动态取值，不光可以用#{参数名}这种方式还可以用#{param1}这种方式。
+
+**MapperMethod**类在分拣完目标方法后就正式调用sqlSession来执行SQL了，我们看一下sqlSession是如何执行的。这里执行的是selectOne()方法。从源码中可以看到mybatis做查询的时候除了**selectCursor**方法，其余的查询最终都会用selectList方法去执行：
+```
+public class DefaultSqlSession implements SqlSession {
+
+  private <E> List<E> selectList(String statement, Object parameter, RowBounds rowBounds, ResultHandler handler) {
+    try {
+      MappedStatement ms = configuration.getMappedStatement(statement);
+      return executor.query(ms, wrapCollection(parameter), rowBounds, handler);
+    } catch (Exception e) {
+      throw ExceptionFactory.wrapException("Error querying database.  Cause: " + e, e);
+    } finally {
+      ErrorContext.instance().reset();
+    }
+  }
+......
+}
+```
+## mybatis执行SQL语句的过程
+可以看到**executor**正是我们上一篇分析出来的mybatis执行SQL语句的核心组件。也就是说mybatis前面都在准备食材，现在才正式下锅炒菜。
+
+那么mybatis是如何炒菜的呢？我们继续看一下：
+```
+public interface Executor {
+
+  ResultHandler NO_RESULT_HANDLER = null;
+
+  int update(MappedStatement ms, Object parameter) throws SQLException;
+
+  <E> List<E> query(MappedStatement ms, Object parameter, RowBounds rowBounds, ResultHandler resultHandler, CacheKey cacheKey, BoundSql boundSql) throws SQLException;
+
+  <E> List<E> query(MappedStatement ms, Object parameter, RowBounds rowBounds, ResultHandler resultHandler) throws SQLException;
+ ......
+}
+```
+**Executor**是一个接口，首先要搞清楚谁是实现类，我们上一篇分析的是如果没有指定**executorType**，那么默认的Executor就是**SimpleExecutor**。
+```java
+public Executor newExecutor(Transaction transaction, ExecutorType executorType) {
+    executorType = executorType == null ? defaultExecutorType : executorType;
+    executorType = executorType == null ? ExecutorType.SIMPLE : executorType;
+    Executor executor;
+    if (ExecutorType.BATCH == executorType) {
+      executor = new BatchExecutor(this, transaction);
+    } else if (ExecutorType.REUSE == executorType) {
+      executor = new ReuseExecutor(this, transaction);
+    } else {
+      executor = new SimpleExecutor(this, transaction);
+    }
+    if (cacheEnabled) {
+      executor = new CachingExecutor(executor);
+    }
+    executor = (Executor) interceptorChain.pluginAll(executor);
+    return executor;
+  }
+```
+其实不是，因为默认**cacheEnabled**是true，也就是说executor是**CachingExecutor**，而**CachingExecutor**再把**SimpleExecutor**包装起来。也就是说mybatis在这个地方使用了一个简单的**装饰器模式**，使**SimpleExecutor**增强了一个缓存功能。
+
+我们再来看一下**CachingExecutor**是如何使用缓存的：
+
+```java
+public class CachingExecutor implements Executor {
+
+  private final Executor delegate;
+  private final TransactionalCacheManager tcm = new TransactionalCacheManager();
+
+  public CachingExecutor(Executor delegate) {
+    this.delegate = delegate;
+    delegate.setExecutorWrapper(this);
+  }
+  @Override
+  public <E> List<E> query(MappedStatement ms, Object parameterObject, RowBounds rowBounds, ResultHandler resultHandler) throws SQLException {
+    BoundSql boundSql = ms.getBoundSql(parameterObject);
+    CacheKey key = createCacheKey(ms, parameterObject, rowBounds, boundSql);
+    return query(ms, parameterObject, rowBounds, resultHandler, key, boundSql);
+  }
+
+  @Override
+  public <E> List<E> query(MappedStatement ms, Object parameterObject, RowBounds rowBounds, ResultHandler resultHandler, CacheKey key, BoundSql boundSql)
+      throws SQLException {
+    Cache cache = ms.getCache();
+    if (cache != null) {
+      flushCacheIfRequired(ms);
+      if (ms.isUseCache() && resultHandler == null) {
+        ensureNoOutParams(ms, boundSql);
+        @SuppressWarnings("unchecked")
+        List<E> list = (List<E>) tcm.getObject(cache, key);
+        if (list == null) {
+          list = delegate.query(ms, parameterObject, rowBounds, resultHandler, key, boundSql);
+          tcm.putObject(cache, key, list); // issue #578 and #116
+        }
+        return list;
+      }
+    }
+    return delegate.query(ms, parameterObject, rowBounds, resultHandler, key, boundSql);
+  }
+......
+}
+```
+**CachingExecutor**在这里操作的cache是**二级缓存**，**二级缓存**策略我们放到后面再研究，这里我们知道**二级缓存**是存在**MappedStatement**这个组件里的，大概的逻辑就是查询结果存在缓存里就直接返回，不存在再去调用**SimpleExecutor**去执行SQL语句。
+
+我们继续往下看**SimpleExecutor**的执行逻辑：
+```
+public abstract class BaseExecutor implements Executor {
+
+  protected PerpetualCache localCache;
+  protected PerpetualCache localOutputParameterCache;
+  protected Configuration configuration;
+
+@Override
+  public <E> List<E> query(MappedStatement ms, Object parameter, RowBounds rowBounds, ResultHandler resultHandler, CacheKey key, BoundSql boundSql) throws SQLException {
+    ErrorContext.instance().resource(ms.getResource()).activity("executing a query").object(ms.getId());
+    if (closed) {
+      throw new ExecutorException("Executor was closed.");
+    }
+    if (queryStack == 0 && ms.isFlushCacheRequired()) {
+      clearLocalCache();
+    }
+    List<E> list;
+    try {
+      queryStack++;
+      list = resultHandler == null ? (List<E>) localCache.getObject(key) : null;
+      if (list != null) {
+        handleLocallyCachedOutputParameters(ms, key, parameter, boundSql);
+      } else {
+        list = queryFromDatabase(ms, parameter, rowBounds, resultHandler, key, boundSql);
+      }
+    } finally {
+      queryStack--;
+    }
+    if (queryStack == 0) {
+      for (DeferredLoad deferredLoad : deferredLoads) {
+        deferredLoad.load();
+      }
+      // issue #601
+      deferredLoads.clear();
+      if (configuration.getLocalCacheScope() == LocalCacheScope.STATEMENT) {
+        // issue #482
+        clearLocalCache();
+      }
+    }
+    return list;
+  }
+
+private <E> List<E> queryFromDatabase(MappedStatement ms, Object parameter, RowBounds rowBounds, ResultHandler resultHandler, CacheKey key, BoundSql boundSql) throws SQLException {
+    List<E> list;
+    localCache.putObject(key, EXECUTION_PLACEHOLDER);
+    try {
+      list = doQuery(ms, parameter, rowBounds, resultHandler, boundSql);
+    } finally {
+      localCache.removeObject(key);
+    }
+    localCache.putObject(key, list);
+    if (ms.getStatementType() == StatementType.CALLABLE) {
+      localOutputParameterCache.putObject(key, parameter);
+    }
+    return list;
+  }
+......
+}
+```
+**SimpleExecutor**继承了**BaseExecutor**的**query()**方法， **BaseExecutor**首先做的事情是从一级缓存**localCache**中去取值，取不到的话再去调用子类的**doQuery**方法去执行SQL，拿到缓存结果后再放到localCache里面。localCache缓存使用是有一定条件的，这个我们也放到后面再讲。
+
+继续来看doQuery方法：
+```java
+public class SimpleExecutor extends BaseExecutor {
+  @Override
+  public <E> List<E> doQuery(MappedStatement ms, Object parameter, RowBounds rowBounds, ResultHandler resultHandler, BoundSql boundSql) throws SQLException {
+    Statement stmt = null;
+    try {
+      Configuration configuration = ms.getConfiguration();
+      StatementHandler handler = configuration.newStatementHandler(wrapper, ms, parameter, rowBounds, resultHandler, boundSql);
+      stmt = prepareStatement(handler, ms.getStatementLog());
+      return handler.query(stmt, resultHandler);
+    } finally {
+      closeStatement(stmt);
+    }
+  }
+
+private Statement prepareStatement(StatementHandler handler, Log statementLog) throws SQLException {
+    Statement stmt;
+    Connection connection = getConnection(statementLog);
+    stmt = handler.prepare(connection, transaction.getTimeout());
+    handler.parameterize(stmt);
+    return stmt;
+  }
+......
+}
+```
+```java
+public class Configuration {
+
+  public StatementHandler newStatementHandler(Executor executor, MappedStatement mappedStatement, Object parameterObject, RowBounds rowBounds, ResultHandler resultHandler, BoundSql boundSql) {
+    StatementHandler statementHandler = new RoutingStatementHandler(executor, mappedStatement, parameterObject, rowBounds, resultHandler, boundSql);
+    statementHandler = (StatementHandler) interceptorChain.pluginAll(statementHandler);
+    return statementHandler;
+  }
+
+}
+```
+**doQuery()**方法会先拿到一个默认**RoutingStatementHandler**，再去连接数据库。拿到数据库连接后就是**StatementHandler**正式出场了。
+
+先来看一下**RoutingStatementHandler**的构造方法。
+```java
+public class RoutingStatementHandler implements StatementHandler {
+
+  private final StatementHandler delegate;
+
+  public RoutingStatementHandler(Executor executor, MappedStatement ms, Object parameter, RowBounds rowBounds, ResultHandler resultHandler, BoundSql boundSql) {
+
+    switch (ms.getStatementType()) {
+      case STATEMENT:
+        delegate = new SimpleStatementHandler(executor, ms, parameter, rowBounds, resultHandler, boundSql);
+        break;
+      case PREPARED:
+        delegate = new PreparedStatementHandler(executor, ms, parameter, rowBounds, resultHandler, boundSql);
+        break;
+      case CALLABLE:
+        delegate = new CallableStatementHandler(executor, ms, parameter, rowBounds, resultHandler, boundSql);
+        break;
+      default:
+        throw new ExecutorException("Unknown statement type: " + ms.getStatementType());
+    }
+  }
+}
+```
+可以看到**RoutingStatementHandler**实际上还不是真正去调用JDBC执行SQL语句的组件，mybatis在这里用了一个简单的**策略模式**，真正去做事的**StatementHandler**是通过**ms.getStatementType()**来判断出来的。
+
+执行SQL语句的StatementHandler有三个策略类：
+1.SimpleStatementHandler 执行简单SQL语句的策略类
+2.PreparedStatementHandler 执行预编译SQL语句的策略类
+3.CallableStatementHandler 执行存储过程SQL语句的策略类
+
+我们的demo使用的是预编译的SQL语句，我们来看一下**PreparedStatementHandler**：
+```java
+public class PreparedStatementHandler extends BaseStatementHandler {
+  @Override
+  public <E> List<E> query(Statement statement, ResultHandler resultHandler) throws SQLException {
+    PreparedStatement ps = (PreparedStatement) statement;
+    ps.execute();
+    return resultSetHandler.handleResultSets(ps);
+  }
+......
+}
+```
+到这里mybatis终于没有什么骚操作了，直接使用JDBC的PreparedStatement执行SQL语句，然后把数据库的返回值交给**ResultHandler**来处理了。
+
+**ResultHandler**顾名思义就是来处理返回值的，由于这篇篇幅太长了，mybatis是如何来处理返回值的我们放到下一篇来讲。总之mybatis终于执行SQL了，我们接下来总结一下整个过程。
+
+1. 从Configuration中获得**MapperProxyFactory**
+2. **MapperProxyFactory**构建定义接口的动态代理对象
+3. 再就是动态代理对象执行查询方法步骤：
+
+
+![mybatis执行过程.jpg](doc/mybatis执行过程.jpg)
+
+本文涉及的源码放在github上：
+[https://github.com/burgleaf/mybatis-study](https://github.com/burgleaf/mybatis-study)
 
 
