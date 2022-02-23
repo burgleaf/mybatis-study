@@ -4,8 +4,22 @@
 <mapper namespace="me.binf.mybatistudy.dao.DistrictMapper">
 
 
+    <resultMap id="districtMap" type="me.binf.mybatistudy.entity.District">
+        <result property="id" column="id"/>
+        <result property="name" column="name"/>
+        <result property="level" column="level"/>
+        <result property="parent_id" column="parent_id"/>
+        <result property="is_special_city" column="is_special_city"/>
+    </resultMap>
+
+
     <select id="getById" resultType="me.binf.mybatistudy.entity.District">
         select * from district where id = #{id}
+    </select>
+
+
+    <select id="getListByParentId" resultMap="districtMap">
+        select * from district where parent_id = #{parentId}
     </select>
 
 

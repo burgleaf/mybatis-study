@@ -2,6 +2,8 @@ package me.binf.mybatistudy.dao;
 
 import me.binf.mybatistudy.entity.District;
 
+import java.util.List;
+
 /**
  * @description:
  * @author: wangbin
@@ -11,4 +13,6 @@ public interface DistrictMapper {
 
 
     District getById(Integer id);
+
+    List<District> getListByParentId(Integer parentId);
 }

@@ -48,11 +48,23 @@ class MybatisStudyApplicationTests {
         sqlSession.close();
     }
 
+    @Test
+    public void testMyBatisForList() throws IOException {
+        //1、得到 SqlSessionFactory
+        SqlSessionFactory sqlSessionFactory = getSqlSessionFactory();
+        //2、得到 sqlSession ,代表和数据库一次回话
+        SqlSession sqlSession = sqlSessionFactory.openSession();
+        //3、得到真正操作数据库的Dao
+        DistrictMapper mapper = sqlSession.getMapper(DistrictMapper.class);
+        List<District> district = mapper.getListByParentId(0);
+        System.out.println(district);
+        sqlSession.close();
+    }
 
     /**
      * 1、根据全局配置文件获取 SqlSessionFactory
      * @return
-     * @throws IOExceptionsqlSessionFactory = {DefaultSqlSessionFactory@6446}
+     * @throws  = {DefaultSqlSessionFactory@6446}
      */
     public SqlSessionFactory getSqlSessionFactory() throws IOException {
         String resource = "mybatis/mybatis-config.xml";
